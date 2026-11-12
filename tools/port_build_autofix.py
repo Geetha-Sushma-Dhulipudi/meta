@@ -238,76 +238,47 @@ def test_patches_against_upstream(port_dir: Path, buildenv_vars: dict, work_dir:
 
 
 def call_copilot_to_generate_patch(context_markdown: str, token: str) -> str:
-    """Call GitHub Copilot Chat API to generate root-cause analysis and unified patch."""
-    if not token:
+    """Call GitHub Copilot CLI (same pattern as create_community_digest.py) to generate fix report."""
+    copilot_bin = os.environ.get("COPILOT_BIN", "copilot")
+    copilot_which = shutil.which(copilot_bin)
+
+    if not copilot_which:
+        print("Copilot CLI not found in PATH. Install with `npm install -g @github/copilot@1.0.102`")
         return ""
 
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/json",
-        "User-Agent": "GitHubCopilot/1.0.0",
-        "Editor-Version": "vscode/1.85.0",
-        "Editor-Plugin-Version": "copilot-chat/0.12.0",
-    }
+    prompt = (
+        "You are an expert z/OS systems software engineer and maintainer for the zopen community.\n"
+        "Analyze the port build/patch failure and output a clean diagnosis report.\n"
+        "You MUST include the exact, complete, valid unified git patch inside a ```diff code block.\n\n"
+        + context_markdown
+    )
 
-    # Step 1: Exchange COPILOT_GITHUB_TOKEN for a Copilot session token & endpoint
-    copilot_token = token
-    api_endpoint = "https://api.individual.githubcopilot.com"
+    env = os.environ.copy()
+    if token:
+        env["COPILOT_GITHUB_TOKEN"] = token
+        env["GITHUB_TOKEN"] = token
+
+    command = [copilot_which, "-s", "--no-color", "--available-tools"]
     try:
-        req = urllib.request.Request("https://api.github.com/copilot_internal/v2/token", headers=headers)
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            copilot_token = data.get("token", token)
-            api_endpoint = data.get("endpoints", {}).get("api", api_endpoint)
-            print(f"✅ Authenticated with GitHub Copilot session service")
+        with tempfile.TemporaryDirectory() as empty_dir:
+            result = subprocess.run(
+                command,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                cwd=empty_dir,
+                env=env,
+            )
+        if result.returncode == 0 and result.stdout.strip():
+            print("✅ Successfully generated fix report using GitHub Copilot CLI")
+            return result.stdout.strip()
+        else:
+            print(f"Copilot CLI exited {result.returncode}: {result.stderr.strip()[-300:]}")
+            return ""
     except Exception as e:
-        print(f"Copilot session token exchange notice: {e}")
-
-    # Step 2: Request Chat Completion from Copilot
-    chat_headers = {
-        "Authorization": f"Bearer {copilot_token}",
-        "Content-Type": "application/json",
-        "User-Agent": "GitHubCopilot/1.0.0",
-        "Editor-Version": "vscode/1.85.0",
-        "Editor-Plugin-Version": "copilot-chat/0.12.0",
-        "Copilot-Integration-Id": "vscode-chat",
-    }
-
-    payload = {
-        "model": "gpt-4o",
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are an expert z/OS systems software engineer and maintainer for the zopen community. "
-                    "Analyze the port build/patch failure and output a clean diagnosis report. "
-                    "You MUST include the exact, complete, valid unified git patch inside a ```diff code block."
-                )
-            },
-            {
-                "role": "user",
-                "content": context_markdown,
-            }
-        ],
-        "temperature": 0.1,
-    }
-
-    data_bytes = json.dumps(payload).encode("utf-8")
-
-    for endpoint_url in [f"{api_endpoint}/chat/completions", "https://api.githubcopilot.com/chat/completions"]:
-        try:
-            req = urllib.request.Request(endpoint_url, data=data_bytes, headers=chat_headers)
-            with urllib.request.urlopen(req, timeout=90) as resp:
-                res_data = json.loads(resp.read().decode("utf-8"))
-                content = res_data["choices"][0]["message"]["content"]
-                if content:
-                    print(f"✅ Successfully received response from GitHub Copilot ({endpoint_url})")
-                    return content
-        except Exception as e:
-            print(f"Copilot API error ({endpoint_url}): {e}")
-            continue
-
-    return ""
+        print(f"Error executing Copilot CLI: {e}")
+        return ""
 
 
 def generate_copilot_facts_bundle(

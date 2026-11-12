@@ -48,9 +48,18 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Copilot CLI
+        run: npm install -g @github/copilot@1.0.102
+
       - name: Verify zopen presence & Run Build Failure Analysis
         id: triage
         env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN || secrets.BUMP_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p /tmp/gh-aw/autofix
@@ -75,7 +84,7 @@ jobs:
             const fs = require('fs');
             let commentBody = '';
             
-            if (fs.existsSync('/tmp/gh-aw/autofix/response.md')) {
+            if (fs.existsSync('/tmp/gh-aw/autofix/response.md') && fs.readFileSync('/tmp/gh-aw/autofix/response.md', 'utf8').trim().length > 0) {
               commentBody = fs.readFileSync('/tmp/gh-aw/autofix/response.md', 'utf8');
             } else {
               commentBody = fs.readFileSync('/tmp/gh-aw/autofix/facts.md', 'utf8');
