@@ -238,24 +238,50 @@ def test_patches_against_upstream(port_dir: Path, buildenv_vars: dict, work_dir:
 
 
 def call_copilot_to_generate_patch(context_markdown: str, token: str) -> str:
-    """Call Copilot / GitHub Models API to generate root-cause analysis and unified patch."""
+    """Call GitHub Copilot Chat API to generate root-cause analysis and unified patch."""
     if not token:
         return ""
 
-    endpoint = "https://models.inference.ai.azure.com/chat/completions"
     headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"token {token}",
+        "Accept": "application/json",
+        "User-Agent": "GitHubCopilot/1.0.0",
+        "Editor-Version": "vscode/1.85.0",
+        "Editor-Plugin-Version": "copilot-chat/0.12.0",
     }
+
+    # Step 1: Exchange COPILOT_GITHUB_TOKEN for a Copilot session token & endpoint
+    copilot_token = token
+    api_endpoint = "https://api.individual.githubcopilot.com"
+    try:
+        req = urllib.request.Request("https://api.github.com/copilot_internal/v2/token", headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            copilot_token = data.get("token", token)
+            api_endpoint = data.get("endpoints", {}).get("api", api_endpoint)
+            print(f"✅ Authenticated with GitHub Copilot session service")
+    except Exception as e:
+        print(f"Copilot session token exchange notice: {e}")
+
+    # Step 2: Request Chat Completion from Copilot
+    chat_headers = {
+        "Authorization": f"Bearer {copilot_token}",
+        "Content-Type": "application/json",
+        "User-Agent": "GitHubCopilot/1.0.0",
+        "Editor-Version": "vscode/1.85.0",
+        "Editor-Plugin-Version": "copilot-chat/0.12.0",
+        "Copilot-Integration-Id": "vscode-chat",
+    }
+
     payload = {
         "model": "gpt-4o",
         "messages": [
             {
                 "role": "system",
                 "content": (
-                    "You are a z/OS systems programming and porting expert for the zopen community. "
-                    "Analyze why the port build or patch failed and output a comprehensive triage report. "
-                    "You MUST include the exact, complete unified git diff patch inside a ```diff code block."
+                    "You are an expert z/OS systems software engineer and maintainer for the zopen community. "
+                    "Analyze the port build/patch failure and output a clean diagnosis report. "
+                    "You MUST include the exact, complete, valid unified git patch inside a ```diff code block."
                 )
             },
             {
@@ -266,14 +292,22 @@ def call_copilot_to_generate_patch(context_markdown: str, token: str) -> str:
         "temperature": 0.1,
     }
 
-    try:
-        req = urllib.request.Request(endpoint, data=json.dumps(payload).encode("utf-8"), headers=headers)
-        with urllib.request.urlopen(req, timeout=90) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data["choices"][0]["message"]["content"]
-    except Exception as e:
-        print(f"Note: Direct Copilot API call fallback: {e}")
-        return ""
+    data_bytes = json.dumps(payload).encode("utf-8")
+
+    for endpoint_url in [f"{api_endpoint}/chat/completions", "https://api.githubcopilot.com/chat/completions"]:
+        try:
+            req = urllib.request.Request(endpoint_url, data=data_bytes, headers=chat_headers)
+            with urllib.request.urlopen(req, timeout=90) as resp:
+                res_data = json.loads(resp.read().decode("utf-8"))
+                content = res_data["choices"][0]["message"]["content"]
+                if content:
+                    print(f"✅ Successfully received response from GitHub Copilot ({endpoint_url})")
+                    return content
+        except Exception as e:
+            print(f"Copilot API error ({endpoint_url}): {e}")
+            continue
+
+    return ""
 
 
 def generate_copilot_facts_bundle(
