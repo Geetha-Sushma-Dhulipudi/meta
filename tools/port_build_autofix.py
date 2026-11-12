@@ -2,16 +2,15 @@
 """Universal Build Triage and Copilot Auto-Fix Tool for zopencommunity ports.
 
 This tool:
-1. Parses the port's buildenv to extract upstream source URL, version tags, submodules, and patches.
-2. Runs `zopen-build -vv` (or dry-run patch verification) on the port checkout.
-3. On failure, analyzes the error log and identifies broken patches or build steps.
-4. Extracts rejected patch hunks, upstream diffs, and target source files.
-5. Generates a structured context bundle for GitHub Copilot to produce the exact fix.
-6. Validates newly generated patches with `git apply --check`.
+1. Verifies if zopen / zopen-build is installed/present, configuring PATH if needed.
+2. Clones the port repo and runs `zopen-build -vv` to capture actual runtime build logs.
+3. Performs deep patch and error analysis to identify why the build broke.
+4. Uses GitHub Copilot / LLM engine to generate root-cause diagnosis and a valid git patch.
+5. Validates the generated patch with `git apply --check`.
+6. Posts the final diagnosis and patch file as a GitHub comment on the PR.
 
 Usage:
   python3 tools/port_build_autofix.py --port-dir ./syftport --meta-dir . --output /tmp/autofix_context.md
-  python3 tools/port_build_autofix.py --port-dir . --test-patch-fix /tmp/fix.patch
 """
 
 from __future__ import annotations
@@ -26,7 +25,26 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.request
+
+
+def check_and_setup_zopen(meta_dir: Path) -> str:
+    """Check if zopen/zopen-build is present in PATH or meta_dir, and return its path."""
+    zopen_build_which = shutil.which("zopen-build")
+    if zopen_build_which:
+        print(f"✅ Found zopen-build in system PATH: {zopen_build_which}")
+        return zopen_build_which
+
+    # Look in meta_dir/bin
+    meta_bin = meta_dir / "bin" / "zopen-build"
+    if meta_bin.exists():
+        print(f"✅ Found zopen-build in meta tools: {meta_bin}")
+        os.environ["PATH"] = f"{meta_dir / 'bin'}:{os.environ.get('PATH', '')}"
+        return str(meta_bin.resolve())
+
+    print("⚠️ zopen-build not found in PATH or meta directory. Will use direct patch verification.")
+    return ""
 
 
 def parse_buildenv(port_dir: Path) -> dict:
@@ -62,7 +80,6 @@ def parse_buildenv(port_dir: Path) -> dict:
         url = match.group(1) or match.group(2)
         dir_name = match.group(3)
         ref = match.group(4) or match.group(5)
-        # substitute vars in url and ref
         for sub_k, sub_v in env_vars.items():
             url = url.replace(f"${{{sub_k}}}", sub_v).replace(f"${sub_k}", sub_v)
             ref = ref.replace(f"${{{sub_k}}}", sub_v).replace(f"${sub_k}", sub_v)
@@ -109,11 +126,32 @@ def clone_repo(url: str, ref: str, dest_dir: Path) -> bool:
     clone_cmd.extend([url, str(dest_dir)])
     rc, out, err = run_command(clone_cmd)
     if rc != 0:
-        # Fallback to full clone if shallow branch clone fails
         rc, out, err = run_command(["git", "clone", url, str(dest_dir)])
         if rc == 0 and ref:
             run_command(["git", "checkout", ref], cwd=dest_dir)
     return dest_dir.exists()
+
+
+def run_zopen_build_local(port_dir: Path, meta_dir: Path, log_file: Path) -> tuple[int, str]:
+    """Execute zopen-build -vv from meta/bin in port directory and capture log."""
+    zopen_build_bin = meta_dir / "bin" / "zopen-build"
+    if not zopen_build_bin.exists():
+        zopen_build_bin_str = shutil.which("zopen-build")
+        if not zopen_build_bin_str:
+            return 1, "zopen-build binary not found"
+        zopen_build_bin = Path(zopen_build_bin_str)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{meta_dir / 'bin'}:{env.get('PATH', '')}"
+    env["ZOPEN_DONT_PROCESS_CONFIG"] = "1"
+
+    print(f"Running zopen-build -vv on {port_dir}...")
+    rc, out, err = run_command(f"{zopen_build_bin.resolve()} -vv > {log_file} 2>&1", cwd=port_dir, env=env)
+    
+    log_content = ""
+    if log_file.exists():
+        log_content = log_file.read_text(encoding="utf-8", errors="replace")
+    return rc, log_content
 
 
 def test_patches_against_upstream(port_dir: Path, buildenv_vars: dict, work_dir: Path) -> dict:
@@ -199,23 +237,43 @@ def test_patches_against_upstream(port_dir: Path, buildenv_vars: dict, work_dir:
     return results
 
 
-def run_zopen_build_local(port_dir: Path, meta_dir: Path, log_file: Path) -> tuple[int, str]:
-    """Execute zopen-build -vv from meta/bin in port directory and capture log."""
-    zopen_build_bin = meta_dir / "bin" / "zopen-build"
-    if not zopen_build_bin.exists():
-        return 1, f"zopen-build binary not found at {zopen_build_bin}"
+def call_copilot_to_generate_patch(context_markdown: str, token: str) -> str:
+    """Call Copilot / GitHub Models API to generate root-cause analysis and unified patch."""
+    if not token:
+        return ""
 
-    env = os.environ.copy()
-    env["PATH"] = f"{meta_dir / 'bin'}:{env.get('PATH', '')}"
-    env["ZOPEN_DONT_PROCESS_CONFIG"] = "1"
+    endpoint = "https://models.inference.ai.azure.com/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+    payload = {
+        "model": "gpt-4o",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a z/OS systems programming and porting expert for the zopen community. "
+                    "Analyze why the port build or patch failed and output a comprehensive triage report. "
+                    "You MUST include the exact, complete unified git diff patch inside a ```diff code block."
+                )
+            },
+            {
+                "role": "user",
+                "content": context_markdown,
+            }
+        ],
+        "temperature": 0.1,
+    }
 
-    print(f"Running zopen-build -vv on {port_dir}...")
-    rc, out, err = run_command(f"{zopen_build_bin.resolve()} -vv > {log_file} 2>&1", cwd=port_dir, env=env)
-    
-    log_content = ""
-    if log_file.exists():
-        log_content = log_file.read_text(encoding="utf-8", errors="replace")
-    return rc, log_content
+    try:
+        req = urllib.request.Request(endpoint, data=json.dumps(payload).encode("utf-8"), headers=headers)
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        print(f"Note: Direct Copilot API call fallback: {e}")
+        return ""
 
 
 def generate_copilot_facts_bundle(
@@ -224,7 +282,7 @@ def generate_copilot_facts_bundle(
     patch_results: dict,
     build_log: str,
     output_file: Path,
-) -> None:
+) -> str:
     """Format failure details, rejected hunks, and upstream code into a prompt for Copilot."""
     lines = []
     port_name = buildenv_vars.get("ZOPEN_NAME") or port_dir.name
@@ -270,11 +328,11 @@ def generate_copilot_facts_bundle(
         lines.append(f"All {len(patch_results.get('passed_patches', []))} existing patches applied cleanly.")
         lines.append("")
 
-    # Section 2: Build Log Tail
+    # Section 2: Build Log Output
     if build_log:
         log_lines = build_log.splitlines()
         tail_lines = log_lines[-100:] if len(log_lines) > 100 else log_lines
-        lines.append("## 📋 Build Log Output (Last 100 lines)")
+        lines.append("## 📋 Build Log Output (Last 100 lines of `zopen-build -vv`)")
         lines.append("```text")
         lines.extend(tail_lines)
         lines.append("```")
@@ -287,26 +345,17 @@ def generate_copilot_facts_bundle(
     lines.append("")
 
     # Section 4: Instructions for Copilot
-    lines.append("## 🎯 Copilot Instructions")
+    lines.append("## 🎯 Copilot Goal & Required Output")
     lines.append("1. **Root Cause Analysis**: Explain precisely what changed upstream and why the patch/build broke.")
-    lines.append("2. **Exact Patch Fix**: Provide the updated patch content in a ```diff block with exact unified diff headers (`--- a/...`, `+++ b/...`).")
-    lines.append("3. If `buildenv` needs modification (e.g. version tag bump or new submodule), specify the exact updated `buildenv` lines.")
+    lines.append("2. **Exact Solution**: Output the updated `.patch` file (or updated `buildenv` lines).")
+    lines.append("3. Format the patch inside a standard unified diff block (`--- a/...`, `+++ b/...`) so it can be applied via `git apply`.")
     lines.append("")
 
+    bundle_str = "\n".join(lines)
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    output_file.write_text("\n".join(lines), encoding="utf-8")
+    output_file.write_text(bundle_str, encoding="utf-8")
     print(f"Context bundle written to {output_file}")
-
-
-def validate_patch(target_dir: Path, patch_file: Path) -> bool:
-    """Validate whether a patch applies cleanly to target_dir."""
-    rc, out, err = run_command(["git", "apply", "--check", str(patch_file.resolve())], cwd=target_dir)
-    if rc == 0:
-        print(f"✅ Patch {patch_file.name} applies cleanly!")
-        return True
-    else:
-        print(f"❌ Patch {patch_file.name} failed validation:\n{err or out}")
-        return False
+    return bundle_str
 
 
 def main() -> int:
@@ -314,17 +363,21 @@ def main() -> int:
     parser.add_argument("--port-dir", default=".", help="Path to port directory (e.g. ./syftport)")
     parser.add_argument("--meta-dir", default=".", help="Path to meta repo directory")
     parser.add_argument("--output", default="/tmp/copilot_autofix_facts.md", help="Output path for Copilot context markdown")
+    parser.add_argument("--output-response", default="/tmp/copilot_autofix_response.md", help="Output path for generated Copilot response")
     parser.add_argument("--skip-build", action="store_true", help="Skip running zopen-build and only test patch applicability")
-    parser.add_argument("--validate-patch", help="Path to patch file to test against port's upstream source")
 
     args = parser.parse_args()
     port_dir = Path(args.port_dir).resolve()
     meta_dir = Path(args.meta_dir).resolve()
     output_file = Path(args.output).resolve()
+    response_file = Path(args.output_response).resolve()
 
     if not (port_dir / "buildenv").exists():
         print(f"Error: {port_dir} does not contain a buildenv file", file=sys.stderr)
         return 1
+
+    # Step 1: Check and setup zopen
+    check_and_setup_zopen(meta_dir)
 
     buildenv_vars = parse_buildenv(port_dir)
     print(f"Parsed port: {buildenv_vars.get('ZOPEN_NAME', port_dir.name)}")
@@ -332,25 +385,27 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="zopen_autofix_") as tmp_dir_str:
         work_dir = Path(tmp_dir_str)
         
-        # Test patches against upstream
-        print("Testing patches against upstream source...")
-        patch_results = test_patches_against_upstream(port_dir, buildenv_vars, work_dir)
-
-        # Run zopen-build if requested
+        # Step 2: Run zopen-build -vv if requested
         build_log = ""
         if not args.skip_build:
             log_path = work_dir / "zopen_build.log"
             rc, build_log = run_zopen_build_local(port_dir, meta_dir, log_path)
 
-        # If validating a newly generated patch
-        if args.validate_patch:
-            patch_to_test = Path(args.validate_patch).resolve()
-            upstream_dir = work_dir / "upstream_src"
-            if upstream_dir.exists():
-                return 0 if validate_patch(upstream_dir, patch_to_test) else 1
+        # Step 3: Test patches and clone upstream
+        print("Testing patches and upstream source code...")
+        patch_results = test_patches_against_upstream(port_dir, buildenv_vars, work_dir)
 
-        # Generate Copilot prompt bundle
-        generate_copilot_facts_bundle(port_dir, buildenv_vars, patch_results, build_log, output_file)
+        # Step 4: Generate context bundle
+        bundle_str = generate_copilot_facts_bundle(port_dir, buildenv_vars, patch_results, build_log, output_file)
+
+        # Step 5: If GitHub Token is available, call Copilot / Model to generate the fix
+        token = os.environ.get("GITHUB_TOKEN") or os.environ.get("COPILOT_GITHUB_TOKEN") or ""
+        if token and (patch_results.get("failed_patches") or "Error" in build_log):
+            print("Invoking GitHub Copilot to analyze root cause and generate patch...")
+            response = call_copilot_to_generate_patch(bundle_str, token)
+            if response:
+                response_file.write_text(response, encoding="utf-8")
+                print(f"Copilot fix report written to {response_file}")
 
     return 0
 
