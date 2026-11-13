@@ -256,7 +256,6 @@ def call_copilot_to_generate_patch(context_markdown: str, token: str) -> str:
     env = os.environ.copy()
     if token:
         env["COPILOT_GITHUB_TOKEN"] = token
-        env["GITHUB_TOKEN"] = token
 
     command = [copilot_which, "-s", "--no-color", "--available-tools"]
     try:
@@ -404,7 +403,8 @@ def main() -> int:
         bundle_str = generate_copilot_facts_bundle(port_dir, buildenv_vars, patch_results, build_log, output_file)
 
         # Step 5: If GitHub Token is available, call Copilot / Model to generate the fix
-        token = os.environ.get("GITHUB_TOKEN") or os.environ.get("COPILOT_GITHUB_TOKEN") or ""
+        # Prefer the Copilot-entitled token; the Actions GITHUB_TOKEN cannot use Copilot.
+        token = os.environ.get("COPILOT_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
         if token and (patch_results.get("failed_patches") or "Error" in build_log):
             print("Invoking GitHub Copilot to analyze root cause and generate patch...")
             response = call_copilot_to_generate_patch(bundle_str, token)
