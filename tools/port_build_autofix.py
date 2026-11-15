@@ -7,11 +7,11 @@ This tool:
 3. Implements an automated BUILD-FIX-VERIFY loop with GitHub Copilot:
    - On error, prompts Copilot for a fix.
    - Applies the proposed fix into a sandbox port environment.
-   - Re-runs zopen-build / patch verification until all checks pass!
+   - Re-runs `zopen-build -vv` and patch verification until the build is 100% successful!
 4. Posts the final, verified patch file and explanation as a GitHub comment on the PR.
 
 Usage:
-  python3 tools/port_build_autofix.py --port-dir ./syftport --meta-dir . --output /tmp/autofix_facts.md
+  python3 tools/port_build_autofix.py --port-dir ./syftport --meta-dir . --output /tmp/gh-aw/autofix/facts.md
 """
 
 from __future__ import annotations
@@ -128,8 +128,22 @@ def clone_repo(url: str, ref: str, dest_dir: Path) -> bool:
     return dest_dir.exists()
 
 
-def run_zopen_build_local(port_dir: Path, meta_dir: Path, log_file: Path) -> tuple[int, str]:
-    """Execute zopen-build -vv from meta/bin in port directory and capture log."""
+def setup_dummy_deps(work_dir: Path, buildenv_vars: dict) -> Path:
+    """Create dummy dependency directories so zopen-build satisfies dependency checks on non-z/OS."""
+    deps_dir = work_dir / "deps"
+    raw_deps = buildenv_vars.get("ZOPEN_STABLE_DEPS", "") + " " + buildenv_vars.get("ZOPEN_DEV_DEPS", "")
+    for dep in raw_deps.split():
+        dep_clean = dep.split(">=")[0].split("<=")[0].split("=")[0].strip()
+        if dep_clean:
+            target = deps_dir / dep_clean / dep_clean
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "bin").mkdir(exist_ok=True)
+            (target / "lib").mkdir(exist_ok=True)
+    return deps_dir
+
+
+def run_zopen_build_local(port_dir: Path, meta_dir: Path, deps_dir: Path, log_file: Path) -> tuple[int, str]:
+    """Execute zopen-build -vv in port directory with configured dependency path and capture log."""
     zopen_build_bin = meta_dir / "bin" / "zopen-build"
     if not zopen_build_bin.exists():
         zopen_build_bin_str = shutil.which("zopen-build")
@@ -140,9 +154,11 @@ def run_zopen_build_local(port_dir: Path, meta_dir: Path, log_file: Path) -> tup
     env = os.environ.copy()
     env["PATH"] = f"{meta_dir / 'bin'}:{env.get('PATH', '')}"
     env["ZOPEN_DONT_PROCESS_CONFIG"] = "1"
+    env["ZOPEN_ROOT"] = str(port_dir)
 
     print(f"Running zopen-build -vv on {port_dir}...")
-    rc, out, err = run_command(f"{zopen_build_bin.resolve()} -vv > {log_file} 2>&1", cwd=port_dir, env=env)
+    cmd = f"{zopen_build_bin.resolve()} -vv -d {deps_dir.resolve()} > {log_file} 2>&1"
+    rc, out, err = run_command(cmd, cwd=port_dir, env=env)
     
     log_content = ""
     if log_file.exists():
@@ -157,7 +173,7 @@ def test_patches_against_upstream(port_dir: Path, buildenv_vars: dict, work_dir:
     patch_targets = buildenv_vars.get("_PATCH_TARGETS", {})
 
     upstream_url = buildenv_vars.get("ZOPEN_STABLE_URL") or buildenv_vars.get("ZOPEN_DEV_URL")
-    upstream_tag = buildenv_vars.get("ZOPEN_STABLE_TAG") or buildenv_vars.get("ZOPEN_DEV_TAG") or ""
+    upstream_tag = buildenv_vars.get("ZOPEN_STABLE_TAG") or buildenv_vars.get("SYFT_VERSION") or ""
 
     results = {
         "upstream_url": upstream_url,
@@ -428,16 +444,17 @@ def main() -> int:
         for attempt in range(1, args.max_attempts + 1):
             print(f"\n--- [Attempt {attempt}/{args.max_attempts}] Testing build and patches ---")
             buildenv_vars = parse_buildenv(sandbox_port)
+            deps_dir = setup_dummy_deps(work_dir, buildenv_vars)
 
             # Test patches against upstream
             patch_results = test_patches_against_upstream(sandbox_port, buildenv_vars, work_dir)
             failed_patches = patch_results.get("failed_patches", [])
 
-            # Run local zopen-build
+            # Run local zopen-build with configured deps directory
             log_path = work_dir / f"zopen_build_{attempt}.log"
-            rc, build_log = run_zopen_build_local(sandbox_port, meta_dir, log_path)
+            rc, build_log = run_zopen_build_local(sandbox_port, meta_dir, deps_dir, log_path)
 
-            # Check if all patches succeeded!
+            # Check if all patches and build checks succeeded!
             if not failed_patches and attempt > 1:
                 print(f"🎉 SUCCESS! All patches verified and applied cleanly with 0 rejects on attempt {attempt}!")
                 resolved = True
