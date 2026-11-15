@@ -107,7 +107,8 @@ def run_command(cmd: list[str] | str, cwd: Path | None = None, env: dict | None 
         shell=shell,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     return res.returncode, res.stdout, res.stderr
 
@@ -459,9 +460,19 @@ def main() -> int:
                 print(f"🎉 SUCCESS! All patches verified and applied cleanly with 0 rejects on attempt {attempt}!")
                 resolved = True
                 
-                # Compute diff between original port repo and sandbox
-                diff_cmd = ["git", "diff", "--no-index", str(port_dir), str(sandbox_port)]
-                _, diff_out, _ = run_command(diff_cmd)
+                # Compute diff specifically for patches/ and buildenv
+                diff_out_parts = []
+                if (port_dir / "patches").exists() and (sandbox_port / "patches").exists():
+                    _, d_patches, _ = run_command(["git", "diff", "--no-index", str(port_dir / "patches"), str(sandbox_port / "patches")])
+                    if d_patches.strip():
+                        diff_out_parts.append(d_patches.strip())
+
+                if (port_dir / "buildenv").exists() and (sandbox_port / "buildenv").exists():
+                    _, d_buildenv, _ = run_command(["git", "diff", "--no-index", str(port_dir / "buildenv"), str(sandbox_port / "buildenv")])
+                    if d_buildenv.strip():
+                        diff_out_parts.append(d_buildenv.strip())
+
+                diff_out = "\n\n".join(diff_out_parts)
                 
                 final_report = [
                     f"### 🤖 GitHub Copilot Auto-Fix: Build Verification Succeeded (Attempt #{attempt})\n",
