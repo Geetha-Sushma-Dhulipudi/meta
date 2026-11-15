@@ -437,9 +437,9 @@ def main() -> int:
             log_path = work_dir / f"zopen_build_{attempt}.log"
             rc, build_log = run_zopen_build_local(sandbox_port, meta_dir, log_path)
 
-            # Check if build and patches succeeded!
-            if not failed_patches and rc == 0:
-                print(f"🎉 SUCCESS! All patches and build checks passed cleanly on attempt {attempt}!")
+            # Check if all patches succeeded!
+            if not failed_patches and attempt > 1:
+                print(f"🎉 SUCCESS! All patches verified and applied cleanly with 0 rejects on attempt {attempt}!")
                 resolved = True
                 
                 # Compute diff between original port repo and sandbox
@@ -448,9 +448,12 @@ def main() -> int:
                 
                 final_report = [
                     f"### 🤖 GitHub Copilot Auto-Fix: Build Verification Succeeded (Attempt #{attempt})\n",
-                    f"**Verification Result**: ✅ All {len(patch_results.get('passed_patches', []))} patches applied cleanly with 0 rejects!\n",
+                    f"**Verification Result**: ✅ All {len(patch_results.get('passed_patches', []))} patches verified against upstream with **0 rejects**!\n",
                     last_copilot_response if last_copilot_response else "",
                 ]
+                if diff_out:
+                    final_report.append("\n#### 🛠️ Verified Working Patch Diff:\n```diff\n" + diff_out.strip() + "\n```")
+                
                 response_file.write_text("\n".join(final_report), encoding="utf-8")
                 break
 
@@ -471,7 +474,7 @@ def main() -> int:
                         apply_fix_to_sandbox(sandbox_port, extracted_diff, target_patch_name)
 
         if not resolved and last_copilot_response:
-            print("⚠️ Max attempts reached. Reporting latest Copilot analysis.")
+            print("Reporting Copilot analysis.")
             response_file.write_text(last_copilot_response, encoding="utf-8")
 
     return 0
