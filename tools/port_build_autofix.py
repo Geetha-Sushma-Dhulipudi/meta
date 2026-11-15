@@ -3,14 +3,15 @@
 
 This tool:
 1. Verifies if zopen / zopen-build is installed/present, configuring PATH if needed.
-2. Clones the port repo and runs `zopen-build -vv` to capture actual runtime build logs.
-3. Performs deep patch and error analysis to identify why the build broke.
-4. Uses GitHub Copilot / LLM engine to generate root-cause diagnosis and a valid git patch.
-5. Validates the generated patch with `git apply --check`.
-6. Posts the final diagnosis and patch file as a GitHub comment on the PR.
+2. Clones the port repo and tests patches against upstream releases.
+3. Implements an automated BUILD-FIX-VERIFY loop with GitHub Copilot:
+   - On error, prompts Copilot for a fix.
+   - Applies the proposed fix into a sandbox port environment.
+   - Re-runs zopen-build / patch verification until all checks pass!
+4. Posts the final, verified patch file and explanation as a GitHub comment on the PR.
 
 Usage:
-  python3 tools/port_build_autofix.py --port-dir ./syftport --meta-dir . --output /tmp/autofix_context.md
+  python3 tools/port_build_autofix.py --port-dir ./syftport --meta-dir . --output /tmp/autofix_facts.md
 """
 
 from __future__ import annotations
@@ -36,7 +37,6 @@ def check_and_setup_zopen(meta_dir: Path) -> str:
         print(f"✅ Found zopen-build in system PATH: {zopen_build_which}")
         return zopen_build_which
 
-    # Look in meta_dir/bin
     meta_bin = meta_dir / "bin" / "zopen-build"
     if meta_bin.exists():
         print(f"✅ Found zopen-build in meta tools: {meta_bin}")
@@ -55,7 +55,6 @@ def parse_buildenv(port_dir: Path) -> dict:
 
     content = buildenv_file.read_text(encoding="utf-8", errors="replace")
     
-    # Extract simple export VAR="VAL" and VAR="VAL" definitions
     env_vars = {}
     for line in content.splitlines():
         line = line.strip()
@@ -67,14 +66,12 @@ def parse_buildenv(port_dir: Path) -> dict:
             val = m.group(2) if m.group(2) is not None else (m.group(3) if m.group(3) is not None else m.group(4))
             env_vars[key] = val
 
-    # Resolve variable substitutions like ${SYFT_VERSION} in ZOPEN_STABLE_TAG
     for k, v in list(env_vars.items()):
         if isinstance(v, str) and "${" in v:
             for sub_k, sub_v in env_vars.items():
                 v = v.replace(f"${{{sub_k}}}", sub_v).replace(f"${sub_k}", sub_v)
             env_vars[k] = v
 
-    # Extract clone_module calls: clone_module <url> <dir> <ref>
     modules = {}
     for match in re.finditer(r'clone_module\s+(?:"([^"]+)"|([^\s]+))\s+([^\s]+)\s+(?:"([^"]+)"|([^\s]+))', content):
         url = match.group(1) or match.group(2)
@@ -85,7 +82,6 @@ def parse_buildenv(port_dir: Path) -> dict:
             ref = ref.replace(f"${{{sub_k}}}", sub_v).replace(f"${sub_k}", sub_v)
         modules[dir_name] = {"url": url, "ref": ref}
 
-    # Extract apply_port_patch calls: apply_port_patch <dir> <patch>
     patch_targets = {}
     for match in re.finditer(r'apply_port_patch\s+([^\s]+)\s+([^\s]+)', content):
         target_dir = match.group(1)
@@ -197,12 +193,18 @@ def test_patches_against_upstream(port_dir: Path, buildenv_vars: dict, work_dir:
         if not target_dir or not target_dir.exists():
             continue
 
+        # Clean git state before applying
+        run_command(["git", "checkout", "."], cwd=target_dir)
+        run_command(["git", "clean", "-fdx"], cwd=target_dir)
+
         rc, out, err = run_command(["git", "apply", "--check", str(patch_path.resolve())], cwd=target_dir)
         if rc == 0:
             results["passed_patches"].append(patch_name)
         else:
             # Patch failed! Extract rejected hunks
             src_copy = work_dir / f"src_{patch_name}"
+            if src_copy.exists():
+                shutil.rmtree(src_copy)
             shutil.copytree(target_dir, src_copy, symlinks=True, ignore=shutil.ignore_patterns(".git"))
             rc_rej, out_rej, err_rej = run_command(["git", "apply", "--reject", str(patch_path.resolve())], cwd=src_copy)
             
@@ -238,12 +240,12 @@ def test_patches_against_upstream(port_dir: Path, buildenv_vars: dict, work_dir:
 
 
 def call_copilot_to_generate_patch(context_markdown: str, token: str) -> str:
-    """Call GitHub Copilot CLI (same pattern as create_community_digest.py) to generate fix report."""
+    """Call GitHub Copilot CLI to generate diagnosis and patch fix."""
     copilot_bin = os.environ.get("COPILOT_BIN", "copilot")
     copilot_which = shutil.which(copilot_bin)
 
     if not copilot_which:
-        print("Copilot CLI not found in PATH. Install with `npm install -g @github/copilot@1.0.102`")
+        print("Copilot CLI not found in PATH.")
         return ""
 
     prompt = (
@@ -256,6 +258,7 @@ def call_copilot_to_generate_patch(context_markdown: str, token: str) -> str:
     env = os.environ.copy()
     if token:
         env["COPILOT_GITHUB_TOKEN"] = token
+        env["GITHUB_TOKEN"] = token
 
     command = [copilot_which, "-s", "--no-color", "--available-tools"]
     try:
@@ -273,11 +276,44 @@ def call_copilot_to_generate_patch(context_markdown: str, token: str) -> str:
             print("✅ Successfully generated fix report using GitHub Copilot CLI")
             return result.stdout.strip()
         else:
-            print(f"Copilot CLI exited {result.returncode}: {result.stderr.strip()[-300:]}")
+            print(f"Copilot CLI notice: {result.stderr.strip()[-200:]}")
             return ""
     except Exception as e:
         print(f"Error executing Copilot CLI: {e}")
         return ""
+
+
+def extract_diff_from_markdown(markdown_text: str) -> str:
+    """Extract valid unified diff code block from markdown text."""
+    diff_blocks = re.findall(r'```(?:diff|patch)?\n([\s\S]*?)\n```', markdown_text)
+    for block in diff_blocks:
+        if "---" in block and "+++" in block:
+            return block.strip()
+    return ""
+
+
+def apply_fix_to_sandbox(sandbox_port: Path, patch_diff: str, failed_patch_name: str) -> bool:
+    """Apply generated diff to sandbox patches or buildenv."""
+    if not patch_diff:
+        return False
+
+    if "--- a/buildenv" in patch_diff or "+++ b/buildenv" in patch_diff:
+        tmp_patch = sandbox_port / "temp_buildenv.patch"
+        tmp_patch.write_text(patch_diff + "\n", encoding="utf-8")
+        rc, out, err = run_command(["git", "apply", "--ignore-whitespace", str(tmp_patch)], cwd=sandbox_port)
+        tmp_patch.unlink(missing_ok=True)
+        if rc == 0:
+            print("✅ Successfully applied buildenv patch to sandbox")
+            return True
+
+    if failed_patch_name:
+        target_patch_file = sandbox_port / "patches" / failed_patch_name
+        if target_patch_file.exists():
+            target_patch_file.write_text(patch_diff + "\n", encoding="utf-8")
+            print(f"✅ Updated {failed_patch_name} in sandbox with Copilot fix")
+            return True
+
+    return False
 
 
 def generate_copilot_facts_bundle(
@@ -286,13 +322,14 @@ def generate_copilot_facts_bundle(
     patch_results: dict,
     build_log: str,
     output_file: Path,
+    iteration: int = 1,
 ) -> str:
     """Format failure details, rejected hunks, and upstream code into a prompt for Copilot."""
     lines = []
     port_name = buildenv_vars.get("ZOPEN_NAME") or port_dir.name
     version = buildenv_vars.get("ZOPEN_STABLE_TAG") or buildenv_vars.get("SYFT_VERSION") or "latest"
 
-    lines.append(f"# Port Build Failure Analysis & Fix Request: `{port_name}` ({version})")
+    lines.append(f"# Port Build Failure Analysis & Fix Request (Attempt #{iteration}): `{port_name}` ({version})")
     lines.append("")
     lines.append("## Overview")
     lines.append(f"- **Port Name**: `{port_name}`")
@@ -300,7 +337,6 @@ def generate_copilot_facts_bundle(
     lines.append(f"- **Upstream Repository**: `{buildenv_vars.get('ZOPEN_STABLE_URL', 'N/A')}`")
     lines.append("")
 
-    # Section 1: Patch Application Failures
     failed_patches = patch_results.get("failed_patches", [])
     if failed_patches:
         lines.append("## ❌ Failed Patches Detected")
@@ -332,7 +368,6 @@ def generate_copilot_facts_bundle(
         lines.append(f"All {len(patch_results.get('passed_patches', []))} existing patches applied cleanly.")
         lines.append("")
 
-    # Section 2: Build Log Output
     if build_log:
         log_lines = build_log.splitlines()
         tail_lines = log_lines[-100:] if len(log_lines) > 100 else log_lines
@@ -342,13 +377,11 @@ def generate_copilot_facts_bundle(
         lines.append("```")
         lines.append("")
 
-    # Section 3: Port's buildenv
     buildenv_content = (port_dir / "buildenv").read_text(encoding="utf-8", errors="replace")
     lines.append("## ⚙️ Port `buildenv` File")
     lines.append(f"```bash\n{buildenv_content}\n```")
     lines.append("")
 
-    # Section 4: Instructions for Copilot
     lines.append("## 🎯 Copilot Goal & Required Output")
     lines.append("1. **Root Cause Analysis**: Explain precisely what changed upstream and why the patch/build broke.")
     lines.append("2. **Exact Solution**: Output the updated `.patch` file (or updated `buildenv` lines).")
@@ -358,7 +391,6 @@ def generate_copilot_facts_bundle(
     bundle_str = "\n".join(lines)
     output_file.parent.mkdir(parents=True, exist_ok=True)
     output_file.write_text(bundle_str, encoding="utf-8")
-    print(f"Context bundle written to {output_file}")
     return bundle_str
 
 
@@ -366,9 +398,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="zopencommunity Port Build Triage & Copilot Auto-Fix")
     parser.add_argument("--port-dir", default=".", help="Path to port directory (e.g. ./syftport)")
     parser.add_argument("--meta-dir", default=".", help="Path to meta repo directory")
-    parser.add_argument("--output", default="/tmp/copilot_autofix_facts.md", help="Output path for Copilot context markdown")
-    parser.add_argument("--output-response", default="/tmp/copilot_autofix_response.md", help="Output path for generated Copilot response")
-    parser.add_argument("--skip-build", action="store_true", help="Skip running zopen-build and only test patch applicability")
+    parser.add_argument("--output", default="/tmp/gh-aw/autofix/facts.md", help="Output path for Copilot context markdown")
+    parser.add_argument("--output-response", default="/tmp/gh-aw/autofix/response.md", help="Output path for generated Copilot response")
+    parser.add_argument("--max-attempts", type=int, default=3, help="Max retry attempts for build-fix-verify loop")
 
     args = parser.parse_args()
     port_dir = Path(args.port_dir).resolve()
@@ -380,37 +412,67 @@ def main() -> int:
         print(f"Error: {port_dir} does not contain a buildenv file", file=sys.stderr)
         return 1
 
-    # Step 1: Check and setup zopen
     check_and_setup_zopen(meta_dir)
-
-    buildenv_vars = parse_buildenv(port_dir)
-    print(f"Parsed port: {buildenv_vars.get('ZOPEN_NAME', port_dir.name)}")
+    token = os.environ.get("COPILOT_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
 
     with tempfile.TemporaryDirectory(prefix="zopen_autofix_") as tmp_dir_str:
         work_dir = Path(tmp_dir_str)
-        
-        # Step 2: Run zopen-build -vv if requested
-        build_log = ""
-        if not args.skip_build:
-            log_path = work_dir / "zopen_build.log"
-            rc, build_log = run_zopen_build_local(port_dir, meta_dir, log_path)
+        sandbox_port = work_dir / "sandbox_port"
+        shutil.copytree(port_dir, sandbox_port, symlinks=True, ignore=shutil.ignore_patterns(".git"))
 
-        # Step 3: Test patches and clone upstream
-        print("Testing patches and upstream source code...")
-        patch_results = test_patches_against_upstream(port_dir, buildenv_vars, work_dir)
+        print(f"🚀 Starting Build-Fix-Verify loop for {port_dir.name} (Max Attempts: {args.max_attempts})...")
 
-        # Step 4: Generate context bundle
-        bundle_str = generate_copilot_facts_bundle(port_dir, buildenv_vars, patch_results, build_log, output_file)
+        last_copilot_response = ""
+        resolved = False
 
-        # Step 5: If GitHub Token is available, call Copilot / Model to generate the fix
-        # Prefer the Copilot-entitled token; the Actions GITHUB_TOKEN cannot use Copilot.
-        token = os.environ.get("COPILOT_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
-        if token and (patch_results.get("failed_patches") or "Error" in build_log):
-            print("Invoking GitHub Copilot to analyze root cause and generate patch...")
-            response = call_copilot_to_generate_patch(bundle_str, token)
-            if response:
-                response_file.write_text(response, encoding="utf-8")
-                print(f"Copilot fix report written to {response_file}")
+        for attempt in range(1, args.max_attempts + 1):
+            print(f"\n--- [Attempt {attempt}/{args.max_attempts}] Testing build and patches ---")
+            buildenv_vars = parse_buildenv(sandbox_port)
+
+            # Test patches against upstream
+            patch_results = test_patches_against_upstream(sandbox_port, buildenv_vars, work_dir)
+            failed_patches = patch_results.get("failed_patches", [])
+
+            # Run local zopen-build
+            log_path = work_dir / f"zopen_build_{attempt}.log"
+            rc, build_log = run_zopen_build_local(sandbox_port, meta_dir, log_path)
+
+            # Check if build and patches succeeded!
+            if not failed_patches and rc == 0:
+                print(f"🎉 SUCCESS! All patches and build checks passed cleanly on attempt {attempt}!")
+                resolved = True
+                
+                # Compute diff between original port repo and sandbox
+                diff_cmd = ["git", "diff", "--no-index", str(port_dir), str(sandbox_port)]
+                _, diff_out, _ = run_command(diff_cmd)
+                
+                final_report = [
+                    f"### 🤖 GitHub Copilot Auto-Fix: Build Verification Succeeded (Attempt #{attempt})\n",
+                    f"**Verification Result**: ✅ All {len(patch_results.get('passed_patches', []))} patches applied cleanly with 0 rejects!\n",
+                    last_copilot_response if last_copilot_response else "",
+                ]
+                response_file.write_text("\n".join(final_report), encoding="utf-8")
+                break
+
+            # If errors remain, generate prompt and query Copilot
+            print(f"Attempt {attempt}: Found {len(failed_patches)} failing patch(es). Asking Copilot for fix...")
+            bundle_str = generate_copilot_facts_bundle(sandbox_port, buildenv_vars, patch_results, build_log, output_file, iteration=attempt)
+
+            if token:
+                copilot_reply = call_copilot_to_generate_patch(bundle_str, token)
+                if copilot_reply:
+                    last_copilot_response = copilot_reply
+                    response_file.write_text(copilot_reply, encoding="utf-8")
+                    
+                    # Extract diff and apply into sandbox
+                    extracted_diff = extract_diff_from_markdown(copilot_reply)
+                    target_patch_name = failed_patches[0]["patch_name"] if failed_patches else ""
+                    if extracted_diff:
+                        apply_fix_to_sandbox(sandbox_port, extracted_diff, target_patch_name)
+
+        if not resolved and last_copilot_response:
+            print("⚠️ Max attempts reached. Reporting latest Copilot analysis.")
+            response_file.write_text(last_copilot_response, encoding="utf-8")
 
     return 0
 
